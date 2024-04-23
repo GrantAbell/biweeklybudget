@@ -36,257 +36,75 @@ Jason Antman <jason@jasonantman.com> <http://www.jasonantman.com>
 """
 
 import os
-import importlib
-import logging
-from datetime import timedelta, datetime
-from babel.numbers import validate_currency, UnknownCurrencyError
-from babel import Locale, UnknownLocaleError
+from datetime import timedelta, date
 
-logger = logging.getLogger(__name__)
+#: String to identify paycheck transactions
+PAYROLL_STRING = 'payroll'
+#: Address to connect to Vault at, for OFX credentials
+VAULT_ADDR = 'http://127.0.0.1:8200'
 
-_REQUIRED_VARS = [
-    'DB_CONNSTRING',
-    'DEFAULT_ACCOUNT_ID',
-    'PAY_PERIOD_START_DATE',
-    'RECONCILE_BEGIN_DATE',
-    'STALE_DATA_TIMEDELTA',
-    'CURRENCY_CODE'
-]
+#: Path to read Vault token from, for OFX credentials
+TOKEN_PATH = 'vault_token.txt'
 
-_DATE_VARS = [
-    'PAY_PERIOD_START_DATE',
-    'RECONCILE_BEGIN_DATE'
-]
-_TIMEDELTA_VARS = [
-    'STALE_DATA_TIMEDELTA'
-]
-_INT_VARS = [
-    'DEFAULT_ACCOUNT_ID',
-    'FUEL_BUDGET_ID',
-    'BIWEEKLYBUDGET_TEST_TIMESTAMP'
-]
-_STRING_VARS = [
-    'DB_CONNSTRING',
-    'STATEMENTS_SAVE_PATH',
-    'TOKEN_PATH',
-    'VAULT_ADDR',
-    'LOCALE_NAME',
-    'CURRENCY_CODE',
-    'FUEL_VOLUME_UNIT',
-    'FUEL_VOLUME_ABBREVIATION',
-    'FUEL_ECO_ABBREVIATION',
-    'PLAID_CLIENT_ID',
-    'PLAID_SECRET',
-    'PLAID_ENV',
-    'PLAID_PRODUCTS',
-    'PLAID_COUNTRY_CODES',
-    'PLAID_USER_ID',
-]
+#: Path to download OFX statements to, and for backfill_ofx to read them from
+STATEMENTS_SAVE_PATH = os.path.expanduser('~/ofx')
 
-#: A `RFC 5646 / BCP 47 <https://tools.ietf.org/html/bcp47>`_ Language Tag
-#: with a Region suffix to use for number (currency) formatting, i.e. "en_US",
-#: "en_GB", "de_DE", etc. If this is not specified (None), it will be looked up
-#: from environment variables in the following order: LC_ALL, LC_MONETARY, LANG.
-#: If none of those variables are set to a valid locale name (not including
-#: the "C" locale, which does not specify currency formatting) and this variable
-#: is not set, the application will default to "en_US". This setting only
-#: effects how monetary values are displayed in the UI, logs, etc. For further
-#: information, see
-#: :ref:`Currency Formatting and Localization <app_usage.l10n>`.
-LOCALE_NAME = None
-
-#: An `ISO 4217 <https://en.wikipedia.org/wiki/ISO_4217>`_ Currency Code
-#: specifying the currency to use for all monetary amounts, i.e. "USD", "EUR",
-#: etc. This setting only effects how monetary values are displayed in the UI,
-#: logs, etc. Currently defaults to "USD". For further information, see
-#: :ref:`Currency Formatting and Localization <app_usage.l10n>`.
-CURRENCY_CODE = 'USD'
-
-#: The full written name of your unit of measure for volume of fuel, to be used
-#: for the Fuel Log feature. As an example, ``Gallons`` or ``Litres``.
-FUEL_VOLUME_UNIT = 'Gallons'
-
-#: Abbreviation of :py:attr:`biweeklybudget.settings.FUEL_VOLUME_UNIT`, such as
-#: ``Gal.`` or ``L``.
-FUEL_VOLUME_ABBREVIATION = 'Gal.'
-
-#: The full written name of your unit of distance for fuel economy calculations
-#: and the Fuel Log. As an example, ``Miles`` or ``Kilometers``.
-DISTANCE_UNIT = 'Miles'
-
-#: Abbreviation of :py:attr:`biweeklybudget.settings.DISTANCE_UNIT`, such as
-#: ``Mi.`` or ``KM``.
-DISTANCE_UNIT_ABBREVIATION = 'Mi.'
-
-#: Abbreviation for your distance-per-volume fuel economy measurement,
-#: such as ``MPG`` or ``KM/L``.
-FUEL_ECO_ABBREVIATION = 'MPG'
-
-#: string - SQLAlchemy database connection string. See the
-#: :ref:`SQLAlchemy Database URLS docs <sqlalchemy:database_urls>`
-#: for further information.
+#: SQLAlchemy database connection string. Note that the value given in
+#: generated documentation is the value used in CI builds, not the real default.
 DB_CONNSTRING = None
 
-#: int - Account ID to show first in dropdown lists. This must be the database
-#: ID of a valid account.
+# MySQL connection settings
+if 'DB_CONNSTRING' in os.environ:
+    DB_CONNSTRING = os.environ['DB_CONNSTRING']
+else:
+    MYSQL_DBNAME = 'budget'
+    MYSQL_HOST = 'localhost'
+    MYSQL_PORT = 3306
+    MYSQL_USER = 'budgetUser'
+    MYSQL_PASS = ''
+    DB_CONNSTRING = 'mysql+pymysql://{}:{}@{}:{}/{}?charset=utf8mb4'.format(
+        MYSQL_USER, MYSQL_PASS, MYSQL_HOST, MYSQL_PORT, MYSQL_DBNAME
+    )
+
+#: :py:class:`datetime.timedelta` beyond which OFX data will be considered old
+STALE_DATA_TIMEDELTA = timedelta(days=2)
+
+#: The starting date of one pay period. The dates of all pay periods will be
+#: determined based on an interval from this date.
+PAY_PERIOD_START_DATE = date(2024, 1, 12)
+
+#: When listing unreconciled transactions that need to be reconciled, any
+#: :py:class:`~.OFXTransaction` before this date will be ignored.
+RECONCILE_BEGIN_DATE = date(2024, 1, 12)
+
+#: Account ID to show first in dropdown lists
 DEFAULT_ACCOUNT_ID = 1
 
 #: int - Budget ID to select as default when inputting Fuel Log entries. This
 #: must be the database ID of a valid budget.
 FUEL_BUDGET_ID = 1
 
-#: :py:class:`datetime.date` - The starting date of one pay period (generally
-#: the first pay period represented in data in this app). The dates of all pay
-#: periods will be determined based on an interval from this date. This must
-#: be specified in Y-m-d format (i.e. parsable by
-#: :py:meth:`datetime.datetime.strptime` with ``%Y-%m-%d`` format).
-PAY_PERIOD_START_DATE = None
-
-#: :py:class:`datetime.date` - When listing unreconciled transactions that need
-#: to be reconciled, any transaction before this date will be ignored. This must
-#: be specified in Y-m-d format (i.e. parsable by
-#: :py:meth:`datetime.datetime.strptime` with ``%Y-%m-%d`` format).
-RECONCILE_BEGIN_DATE = None
-
-#: :py:class:`datetime.timedelta` - Time interval beyond which OFX data for
-#: accounts will be considered old/stale. This must be specified as a number
-#: (integer) that will be converted to a number of days.
-STALE_DATA_TIMEDELTA = timedelta(days=2)
-
-#: string - *(optional)* Filesystem path to download OFX statements to, and for
-#: backfill_ofx to read them from.
-STATEMENTS_SAVE_PATH = None
-
-#: string - *(optional)* Filesystem path to read Vault token from, for OFX
-#: credentials.
-TOKEN_PATH = None
-
-#: string - *(optional)* Address to connect to Vault at, for OFX credentials.
-VAULT_ADDR = None
-
-#: int - FOR ACCEPTANCE TESTS ONLY - This is used to "fudge" the current time
-#: to the specified integer timestamp. Used for acceptance tests only. Do NOT
-#: set this outside of acceptance testing.
-BIWEEKLYBUDGET_TEST_TIMESTAMP = None
-
 #: Plaid Client ID
-PLAID_CLIENT_ID = None
+PLAID_CLIENT_ID = ''  
 
 #: Plaid Secret (client secret)
-PLAID_SECRET = None
+
+PLAID_SECRET = ''
 
 #: Plaid environment name. Use 'sandbox' to test with Plaid's Sandbox
 #: environment (username: user_good, password: pass_good). Use `development` to
 #: test with live users and credentials and `production` to go live
-PLAID_ENV = None
+PLAID_ENV = 'Development'
 
 #: PLAID_PRODUCTS is a comma-separated list of products to use when initializing
 #: Link. Note that this list must contain 'assets' in order for the app to be
 #: able to create and retrieve asset reports.
-PLAID_PRODUCTS = None
+PLAID_PRODUCTS = 'transactions'
 
 #: PLAID_COUNTRY_CODES is a comma-separated list of countries for which users
 #: will be able to select institutions from.
-PLAID_COUNTRY_CODES = None
+PLAID_COUNTRY_CODES = 'US'
 
 #: PLAID_USER_ID is a unique per-user ID for users of Plaid applications.
 #: Since this is a single-user app, we just hard-code to "1"
 PLAID_USER_ID = '1'
-
-if 'SETTINGS_MODULE' in os.environ:
-    logger.debug('Attempting to import settings module %s',
-                 os.environ['SETTINGS_MODULE'])
-    modname = os.environ.get('SETTINGS_MODULE')
-    m = importlib.import_module(modname)
-    module_dict = m.__dict__
-    try:
-        to_import = m.__all__
-    except AttributeError:
-        to_import = [name for name in module_dict if not name.startswith('_')]
-    v = {name: module_dict[name] for name in to_import}
-    logger.debug('Import from SETTINGS_MODULE: %s', v)
-    globals().update(v)
-else:
-    logger.debug('SETTINGS_MODULE not defined')
-
-for varname in _STRING_VARS:
-    if varname not in os.environ:
-        continue
-    logger.debug('Setting %S from env var: %s', varname, os.environ[varname])
-    globals()[varname] = os.environ[varname]
-
-for varname in _INT_VARS:
-    if varname not in os.environ:
-        continue
-    try:
-        value = int(os.environ[varname])
-        assert os.environ[varname] == '%s' % value
-    except Exception:
-        raise SystemExit('ERROR: env var %s cannot parse as int' % varname)
-    logger.debug('Setting %S from env var: %s', varname, value)
-    globals()[varname] = value
-
-for varname in _TIMEDELTA_VARS:
-    if varname not in os.environ:
-        continue
-    try:
-        value = int(os.environ[varname])
-        assert os.environ[varname] == '%s' % value
-    except Exception:
-        raise SystemExit('ERROR: env var %s cannot parse as int' % varname)
-    value = timedelta(days=value)
-    logger.debug('Setting %S from env var: %s', varname, value)
-    globals()[varname] = value
-
-for varname in _DATE_VARS:
-    if varname not in os.environ:
-        continue
-    try:
-        value = datetime.strptime(os.environ[varname], '%Y-%m-%d')
-    except Exception:
-        raise SystemExit('ERROR: env var %s cannot parse as %Y-%m-%d' % varname)
-    logger.debug('Setting %S from env var: %s', varname, value)
-    globals()[varname] = value
-
-for varname in _REQUIRED_VARS:
-    if globals().get(varname, None) is None:
-        raise SystemExit(
-            'ERROR: setting or environment variable "%s" must be set' % varname
-        )
-
-# Handle the "LOCALE_NAME" variable special logic for default if not specified.
-if LOCALE_NAME is None or LOCALE_NAME == 'C' or LOCALE_NAME.startswith('C.'):
-    logger.debug('LOCALE_NAME unset or C locale')
-    for varname in ['LC_ALL', 'LC_MONETARY', 'LANG']:
-        val = os.environ.get(varname, '').strip()
-        if val != '' and val != 'C' and not val.startswith('C.'):
-            logger.debug(
-                'Setting LOCALE_NAME to %s from env var %s', val, varname
-            )
-            LOCALE_NAME = val
-            break
-    if LOCALE_NAME is None:
-        logger.debug('LOCALE_NAME not set; defaulting to en_US')
-        LOCALE_NAME = 'en_US'
-
-# Check for a valid locale
-try:
-    Locale.parse(LOCALE_NAME)
-except UnknownLocaleError:
-    raise SystemExit(
-        'ERROR: LOCALE_NAME setting of "%s" is not a valid BCP 47 Language Tag.'
-        ' See <https://tools.ietf.org/html/bcp47> for more information.' %
-        LOCALE_NAME
-    )
-
-# Check for a valid currency code
-try:
-    validate_currency(CURRENCY_CODE)
-except UnknownCurrencyError:
-    raise SystemExit(
-        'ERROR: CURRENCY_CODE setting of "%s" is not a valid currency code. See'
-        ' <https://en.wikipedia.org/wiki/ISO_4217> for more information and '
-        'a list of valid codes.' % CURRENCY_CODE
-    )
-
-logger.debug('Done loading settings.')
